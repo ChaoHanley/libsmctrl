@@ -1,5 +1,9 @@
 libsmctrl.a
 libsmctrl.o
 libsmctrl.so
+libsmctrl_demo_smid_print
+libsmctrl_test_global_mask
 libsmctrl_test_gpc_info
+libsmctrl_test_next_mask
+libsmctrl_test_stream_mask
 *.pyc

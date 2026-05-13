@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 // In functions that do not return an error code, we favor terminating with an
@@ -123,7 +124,7 @@ struct global_sm_control {
 
 /*** QMD/TMD-based SM Mask Control via Debug Callback. CUDA 11+ ***/
 
-// Tested working on CUDA x86_64 11.0-12.2.
+// Tested working on CUDA x86_64 11.0-13.0.
 // Tested not working on aarch64 or x86_64 10.2
 static const CUuuid callback_funcs_id = {0x2c, (char)0x8e, 0x0a, (char)0xd8, 0x07, 0x10, (char)0xab, 0x4e, (char)0x90, (char)0xdd, 0x54, 0x71, (char)0x9f, (char)0xe5, (char)0xf7, 0x4b};
 #define LAUNCH_DOMAIN 0x3
@@ -131,6 +132,43 @@ static const CUuuid callback_funcs_id = {0x2c, (char)0x8e, 0x0a, (char)0xd8, 0x0
 static uint64_t g_sm_mask = 0;
 static __thread uint64_t g_next_sm_mask = 0;
 static char sm_control_setup_called = 0;
+
+#define MAX_CALLBACK_STREAM_MASKS 128
+struct callback_stream_mask {
+	uintptr_t stream_struct_base;
+	uint64_t mask;
+};
+static struct callback_stream_mask g_callback_stream_masks[MAX_CALLBACK_STREAM_MASKS];
+
+static void set_callback_stream_mask(uintptr_t stream_struct_base, uint64_t mask) {
+	for (int i = 0; i < MAX_CALLBACK_STREAM_MASKS; i++) {
+		if (g_callback_stream_masks[i].stream_struct_base == stream_struct_base) {
+			g_callback_stream_masks[i].mask = mask;
+			return;
+		}
+	}
+	for (int i = 0; i < MAX_CALLBACK_STREAM_MASKS; i++) {
+		if (!g_callback_stream_masks[i].stream_struct_base) {
+			g_callback_stream_masks[i].mask = mask;
+			g_callback_stream_masks[i].stream_struct_base = stream_struct_base;
+			return;
+		}
+	}
+	fprintf(stderr, "libsmctrl: Too many stream masks registered; not applying stream mask.\n");
+}
+
+static int get_callback_stream_mask(uintptr_t stream_struct_base, uint64_t* mask) {
+	if (!stream_struct_base)
+		return 0;
+	for (int i = 0; i < MAX_CALLBACK_STREAM_MASKS; i++) {
+		if (g_callback_stream_masks[i].stream_struct_base == stream_struct_base) {
+			*mask = g_callback_stream_masks[i].mask;
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static void launchCallback(void *ukwn, int domain, int cbid, const void *in_params) {
 	if (*(uint32_t*)in_params < 0x50) {
 		fprintf(stderr, "Unsupported CUDA version for callback-based SM masking. Aborting...\n");
@@ -145,10 +183,17 @@ static void launchCallback(void *ukwn, int domain, int cbid, const void *in_para
 	// TODO: Support QMD version 4 (Hopper), where offset starts at +304 (rather than +84) and is 72 bytes (rather than 8 bytes) wide
 	uint32_t *lower_ptr = (uint32_t*)(**((char***)in_params + 8) + 84);
 	uint32_t *upper_ptr = (uint32_t*)(**((char***)in_params + 8) + 88);
+	uint64_t stream_mask = 0;
+	uintptr_t* params = (uintptr_t*)in_params;
+	int has_stream_mask = get_callback_stream_mask(params[2], &stream_mask)
+	                      || get_callback_stream_mask(params[9], &stream_mask);
 	if (g_next_sm_mask) {
 		*lower_ptr = (uint32_t)g_next_sm_mask;
 		*upper_ptr = (uint32_t)(g_next_sm_mask >> 32);
 		g_next_sm_mask = 0;
+	} else if (has_stream_mask) {
+		*lower_ptr = (uint32_t)stream_mask;
+		*upper_ptr = (uint32_t)(stream_mask >> 32);
 	} else if (!*lower_ptr && !*upper_ptr){
 		// Only apply the global mask if a per-stream mask hasn't been set
 		*lower_ptr = (uint32_t)g_sm_mask;
@@ -228,7 +273,7 @@ void libsmctrl_set_next_mask(uint64_t mask) {
 #define CU_11_7_MASK_OFF 0x3c4
 #define CU_11_8_MASK_OFF 0x47c
 #define CU_12_0_MASK_OFF 0x4cc
-// CUDA 12.0 and 12.1 use the same offset
+// CUDA 12.0, 12.1, and 12.2 use the same offset
 
 // Layout in CUDA's `stream` struct
 struct stream_sm_mask {
@@ -264,7 +309,8 @@ int detect_parker_soc() {
 }
 #endif // __aarch64__
 
-// Should work for CUDA 8.0 through 12.1
+// Should work for CUDA 8.0 through 12.2. CUDA 13+ uses the launch callback
+// path instead, because the stream struct mask offset changed.
 // A cudaStream_t is a CUstream*. We use void* to avoid a cuda.h dependency in
 // our header
 void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
@@ -272,6 +318,12 @@ void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
 	struct stream_sm_mask* hw_mask;
 	int ver;
 	cuDriverGetVersion(&ver);
+	if (ver >= 13000) {
+		if (!sm_control_setup_called)
+			setup_sm_control_11();
+		set_callback_stream_mask((uintptr_t)stream_struct_base, mask);
+		return;
+	}
 	switch (ver) {
 	case 8000:
 		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_8_0_MASK_OFF);
@@ -464,4 +516,3 @@ abort_cuda:
 	fprintf(stderr, "libsmctrl: CUDA call failed due to %s. Failing with EIO...\n", err_str);
 	return EIO;
 }
-
